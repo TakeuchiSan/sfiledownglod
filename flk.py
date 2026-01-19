@@ -1,13 +1,14 @@
-from flask import Flask, request, render_template, send_file
+from flask import Flask, request, render_template, send_file, make_response
 import requests
 import re
 from bs4 import BeautifulSoup as par
 import zipfile
 import io
+import json  # <--- Tambahan Import Penting
 
 app = Flask(__name__)
 
-# --- CONFIG CONSTANTS ---
+# --- HEADERS ---
 HEADERS_SFILE = {
     'authority': 'sfile.co',
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
@@ -29,107 +30,75 @@ def get_session():
     s.headers.update(HEADERS_SFILE)
     return s
 
-def clean_and_unique_filename(filename, config_ext, existing_names):
-    """
-    Membersihkan nama file, memastikan ekstensi benar, dan menangani duplikat.
-    Contoh: "File.hc" -> "File (1).hc" jika sudah ada.
-    """
-    # Format ekstensi target
-    ext = f".{config_ext}".lower() if not config_ext.startswith('.') else config_ext.lower()
-    
-    # 1. Hapus suffix bawaan sfile
-    base = filename.replace(' - sfile.co', '')
-    
-    # 2. Hapus karakter ilegal
-    base = re.sub(r'[\\/*?:"<>|]', "", base)
-    
-    # 3. Hapus ekstensi target jika sudah ada di nama (biar bersih)
-    # Mencegah .hc.hc
-    pattern = re.compile(re.escape(ext), re.IGNORECASE)
-    base = pattern.sub("", base)
-    
-    # 4. Trim spasi
-    base = base.strip()
-    
-    # 5. Rakit nama file
-    final_name = f"{base}{ext}"
-    
-    # 6. Cek Duplikat (Auto Increment)
-    counter = 1
-    root_name = base
-    while final_name in existing_names:
-        final_name = f"{root_name} ({counter}){ext}"
-        counter += 1
-        
-    return final_name
+def clean_filename(filename):
+    return re.sub(r'[\\/*?:"<>|]', "", filename).strip()
 
-def scrape_worker(user_pages, config_filter, target_category, zip_obj):
+def scrape_engine(pages, config_filter, category, zip_obj):
     ses = get_session()
-    local_tas = set()     # Cache ID agar tidak download ulang file sama di sesi ini
-    zip_filenames = set() # Cache Nama File dalam ZIP agar tidak bentrok
-    files_added = 0
-
-    def process_uid(uid):
-        nonlocal files_added
-        url = f'https://sfile.co/{uid}'
+    tas_uid = []
+    
+    # 1. Scrape UID
+    for page in range(1, pages + 1):
         try:
-            resp = ses.get(url)
-            get = par(resp.text, 'html.parser')
-            
-            # Ambil Judul
-            title_tag = re.search('<title>(.*?)</title>', str(get))
-            if not title_tag: return
-            title = title_tag.group(1)
-
-            # Ambil Link Download
-            link_tag = re.search('href="(.*?)" id="download"', str(get))
-            if not link_tag: return
-            link = link_tag.group(1)
-
-            # Filter Config
-            if config_filter.lower() in title.lower():
-                # Masuk halaman download
-                gett = ses.get(link, cookies=ses.cookies.get_dict()).text
-                direct_match = re.search(r'downloadButton.href = "(.*?)";', str(gett))
-                
-                if direct_match:
-                    dl_link = direct_match.group(1).replace(r'\/', '/')
-                    
-                    # Download Konten File
-                    file_content = ses.get(dl_link).content
-                    
-                    # Generate Nama Unik
-                    final_name = clean_and_unique_filename(title, config_filter, zip_filenames)
-                    
-                    # Catat nama file agar tidak dipakai lagi
-                    zip_filenames.add(final_name)
-                    
-                    # Tulis ke ZIP
-                    zip_obj.writestr(final_name, file_content)
-                    files_added += 1
-        except Exception:
-            pass # Skip jika gagal download satu file
-
-    # Loop Halaman
-    for page in range(1, user_pages + 1):
-        try:
-            url_target = f'https://sfile.co/{target_category}?page={page}'
-            resp_text = ses.get(url_target).text
-            links = re.findall('<a href="(.*?)"', str(resp_text))
-            
-            for url in links:
-                id_match = re.search(r'https://sfile.co/(\w+)', str(url))
+            url = f'https://sfile.co/{category}?page={page}'
+            resp = ses.get(url).text
+            source = re.findall('<a href="(.*?)"', str(resp))
+            for link_url in source:
+                id_match = re.search(r'https://sfile.co/(\w+)', str(link_url))
                 if id_match:
                     uid = id_match.group(1)
-                    # Pastikan bukan duplikat dan bukan link kategori
-                    if uid not in local_tas and uid != target_category:
-                        local_tas.add(uid)
-                        if 'latest' not in uid and 'trends' not in uid: 
-                            process_uid(uid)
+                    if uid not in tas_uid and uid != category:
+                        tas_uid.append(uid)
         except:
             continue
 
-    return files_added
+    # 2. Download & Filter
+    processed_files_list = [] # List untuk menyimpan nama file sukses
+    processed_names_set = set() # Set untuk cek duplikat nama
+
+    for uid in tas_uid:
+        try:
+            url_file = f'https://sfile.co/{uid}'
+            resp_file = ses.get(url_file)
+            get = par(resp_file.text, 'html.parser')
+            
+            title_tag = re.search('<title>(.*?)</title>', str(get))
+            if not title_tag: continue
+            title = title_tag.group(1)
+
+            if config_filter.lower() in title.lower():
+                link_tag = re.search('href="(.*?)" id="download"', str(get))
+                if not link_tag: continue
+                link_download_page = link_tag.group(1)
+                
+                gett = ses.get(link_download_page, cookies=ses.cookies.get_dict()).text
+                direct_match = re.search(r'downloadButton.href = "(.*?)";', str(gett))
+                
+                if direct_match:
+                    direct_link = direct_match.group(1).replace(r'\/', '/')
+                    file_content = ses.get(direct_link).content
+                    
+                    clean_name = clean_filename(title.replace(' - sfile.co', ''))
+                    
+                    final_name = clean_name
+                    counter = 1
+                    while final_name in processed_names_set:
+                        final_name = f"{clean_name} ({counter})" # Tambah angka jika kembar
+                        counter += 1
+                    
+                    # Tambahkan ekstensi manual jika hilang (opsional, tapi aman)
+                    if not "." in final_name[-5:]: 
+                         final_name += f".{config_filter}"
+
+                    processed_names_set.add(final_name)
+                    processed_files_list.append(final_name) # Simpan ke list laporan
+
+                    zip_obj.writestr(final_name, file_content)
+                    
+        except:
+            continue
+
+    return processed_files_list
 
 # --- ROUTES ---
 
@@ -140,39 +109,46 @@ def index():
 @app.route('/download_zip', methods=['POST'])
 def download_zip_api():
     try:
-        # Ambil Input
-        try:
-            pages = int(request.form.get('pages', 1))
-        except ValueError:
-            return "Input halaman harus angka", 400
-
+        pages = int(request.form.get('pages', 1))
         config = request.form.get('config', '').strip()
-        category = request.form.get('category', 'latest') # Default latest
+        category = request.form.get('category', 'latest')
         
         if not config: return "Config filter wajib diisi!", 400
-        
-        # Siapkan Buffer ZIP di Memory
+
         mem_zip = io.BytesIO()
         
-        # Mulai Proses
         with zipfile.ZipFile(mem_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-            count = scrape_worker(pages, config, category, zf)
+            # scrape_engine sekarang mengembalikan LIST file, bukan cuma angka
+            success_files = scrape_engine(pages, config, category, zf)
 
         mem_zip.seek(0)
+        total_files = len(success_files)
         
-        if count == 0:
-            return "Tidak ada file ditemukan. Coba tambah halaman atau ganti config.", 404
+        if total_files == 0:
+            return "Tidak ada file ditemukan dengan config tersebut.", 404
 
-        # Kirim File
-        return send_file(
+        filename = f"Sfile-{config}-{total_files}Files.zip"
+        
+        response = make_response(send_file(
             mem_zip,
             mimetype='application/zip',
             as_attachment=True,
-            download_name=f"Pack-{config}-{category}.zip"
-        )
+            download_name=filename
+        ))
+        
+        # --- KIRIM DATA KE FRONTEND ---
+        # 1. Jumlah File
+        response.headers['X-File-Count'] = str(total_files)
+        
+        # 2. Daftar Nama File (Dikirim sebagai JSON String di Header)
+        # Limit header size: Ambil max 50 nama file agar header tidak overflow
+        json_list = json.dumps(success_files[:50]) 
+        response.headers['X-File-List'] = json_list
+        
+        return response
 
     except Exception as e:
         return f"Server Error: {str(e)}", 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=9000, threaded=True)
+    app.run(debug=True, port=8000, threaded=True)
